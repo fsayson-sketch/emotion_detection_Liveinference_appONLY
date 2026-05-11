@@ -1,0 +1,9 @@
+torch
+torchvision
+mediapipe
+catboost
+scikit-learn
+opencv-python
+joblib
+Pillow
+numpy

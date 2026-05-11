@@ -1,0 +1,27 @@
+{
+  "pipeline": "ResNet-50 + MediaPipe CatBoost + Stacking (LR)",
+  "dataset": "FER-2013",
+  "num_classes": 7,
+  "class_names": [
+    "angry",
+    "disgust",
+    "fear",
+    "happy",
+    "neutral",
+    "sad",
+    "surprise"
+  ],
+  "resnet_temperature": 0.9000000000000004,
+  "resnet50_val_acc": 0.69836293974225,
+  "resnet50_tta_test_acc": 0.6972694343828364,
+  "catboost_val_acc": 0.4942695417898663,
+  "catboost_test_acc": 0.5351072722206743,
+  "catboost_f1": 0.47750085981834267,
+  "lr_meta_C": 0.02,
+  "ensemble_method": "LR Meta-Learner",
+  "ensemble_test_acc": 0.6953190303705767,
+  "ensemble_f1": 0.6848648374181747,
+  "ece": 0.01241010897085587,
+  "std_per_class_accuracy": 0.19772053722014113,
+  "std_per_class_f1": 0.11949396350568003
+}
