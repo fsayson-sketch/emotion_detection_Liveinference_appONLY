@@ -12,16 +12,14 @@
     "surprise"
   ],
   "resnet_temperature": 0.9000000000000004,
-  "resnet50_val_acc": 0.69836293974225,
-  "resnet50_tta_test_acc": 0.6972694343828364,
-  "catboost_val_acc": 0.4942695417898663,
-  "catboost_test_acc": 0.5351072722206743,
-  "catboost_f1": 0.47750085981834267,
-  "lr_meta_C": 0.02,
+  "catboost_val_acc": 0.5307689234857215,
+  "catboost_test_acc": 0.5743939816104765,
+  "catboost_f1": 0.5451567219076948,
+  "lr_meta_C": 0.1,
   "ensemble_method": "LR Meta-Learner",
-  "ensemble_test_acc": 0.6953190303705767,
-  "ensemble_f1": 0.6848648374181747,
-  "ece": 0.01241010897085587,
-  "std_per_class_accuracy": 0.19772053722014113,
-  "std_per_class_f1": 0.11949396350568003
+  "ensemble_test_acc": 0.7784898300362217,
+  "ensemble_f1": 0.7679943984287186,
+  "ece": 0.005339303034889029,
+  "std_per_class_accuracy": 0.16622730436267363,
+  "std_per_class_f1": 0.10825877047809837
 }

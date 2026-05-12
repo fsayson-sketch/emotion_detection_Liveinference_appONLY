@@ -1,8 +1,32 @@
 """
-FER-2013 Live Inference — Single File Web App (Mobile Camera Edition)
-===================================================================
-Runs webcam emotion recognition with side-by-side comparison.
-Uses the phone's camera via the browser while keeping the original threading architecture.
+FER-2013 Live Inference — Local Machine (Optimised)
+====================================================
+Runs webcam emotion recognition with side-by-side comparison:
+  CNN (ResNet-50)  |  CatBoost + MediaPipe  |  Stacked Ensemble
+
+Optimisations vs original:
+  - Inference runs in a background thread — camera never blocks
+  - TTA reduced to 1 pass (optional 2-pass flip with USE_TTA flag)
+  - Face crop → tensor via OpenCV/numpy, no PIL overhead
+  - Landmark coords extracted fully in numpy (no Python loop)
+  - Landmark dots drawn with cv2.drawKeypoints (single call)
+  - EMA smoothing on probs — no more flickering predictions
+  - Haar runs on half-res gray for ~4× speedup
+  - torch.inference_mode instead of no_grad
+  - CAP_PROP_BUFFERSIZE=1 — always reads freshest webcam frame
+
+Requirements
+------------
+    pip install torch torchvision mediapipe catboost scikit-learn opencv-python joblib Pillow
+
+Model files (place in models/ subfolder):
+    fer_resnet50_final.pth   fer_catboost.cbm
+    meta_scaler.pkl          meta_learner.pkl
+    face_landmarker.task     detector.tflite
+    results_summary.json     (for temperature scaling)
+
+Keys:
+    q — quit    s — save snapshot
 """
 
 import os, sys, time, warnings, threading
@@ -20,97 +44,6 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 from catboost import CatBoostClassifier
 import joblib
-from flask import Flask, request, jsonify
-import base64
-
-# ══════════════════════════════════════════════════════════════════════
-# HTML Frontend (Embedded) - MODIFIED FOR MOBILE CAMERA
-# ══════════════════════════════════════════════════════════════════════
-
-INDEX_HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FER-2013 Live Inference</title>
-    <style>
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background-color: #121212; color: #ffffff;
-            display: flex; flex-direction: column; align-items: center;
-            margin: 0; padding: 20px;
-        }
-        h1 { margin-bottom: 20px; color: #4CAF50; font-size: 1.5rem; text-align: center;}
-        .video-container {
-            border: 2px solid #333; border-radius: 8px; overflow: hidden;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.5); background: #000;
-            width: 100%; max-width: 1000px;
-        }
-        img { display: block; width: 100%; height: auto; }
-        .instructions { margin-top: 15px; color: #888; font-size: 0.9em; text-align: center;}
-    </style>
-</head>
-<body>
-    <h1>Emotion Detection (Rotate phone to Landscape)</h1>
-    
-    <div class="video-container">
-        <img id="output-stream" src="" alt="Waiting for camera feed...">
-    </div>
-    
-    <video id="webcam" autoplay playsinline style="display:none;"></video>
-
-    <div class="instructions">
-        Using device camera. Processing runs on your laptop backend.
-    </div>
-
-    <script>
-        const video = document.getElementById('webcam');
-        const outputImg = document.getElementById('output-stream');
-        const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
-        
-        let isProcessing = false;
-
-        // Request mobile camera (facingMode: "user" = selfie cam)
-        navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: 640, height: 480 } })
-            .then(stream => { video.srcObject = stream; })
-            .catch(err => { alert("Camera error: " + err.message + "\\n\\nMake sure you are using HTTPS!"); });
-
-        async function processFrame() {
-            if (video.readyState === video.HAVE_ENOUGH_DATA && !isProcessing) {
-                isProcessing = true;
-                
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
-                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                
-                const base64Data = canvas.toDataURL('image/jpeg', 0.6);
-
-                try {
-                    const response = await fetch('/predict', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ image: base64Data })
-                    });
-                    
-                    const result = await response.json();
-                    if (result.image) {
-                        outputImg.src = 'data:image/jpeg;base64,' + result.image;
-                    }
-                } catch (error) {
-                    console.error("Error sending frame:", error);
-                }
-                isProcessing = false;
-            }
-            setTimeout(processFrame, 100);
-        }
-
-        video.addEventListener('play', () => { processFrame(); });
-    </script>
-</body>
-</html>
-"""
 
 # ══════════════════════════════════════════════════════════════════════
 # Config — tweak these
@@ -124,9 +57,9 @@ META_LEARNER    = os.path.join(BASE_DIR, "models", "meta_learner.pkl")
 FACE_LANDMARKER = os.path.join(BASE_DIR, "models", "face_landmarker.task")
 RESULTS_SUMMARY = os.path.join(BASE_DIR, "models", "results_summary.json")
 
-USE_TTA     = False  
-EMA_ALPHA   = 0.35   
-INFER_EVERY = 1      
+USE_TTA     = False  # True = horizontal-flip TTA (more accurate, ~2× slower CNN)
+EMA_ALPHA   = 0.35   # EMA smoothing: lower = smoother/more lag, higher = snappier
+INFER_EVERY = 1      # run inference every N frames (1=every frame, 2=every other)
 
 ALL_CLASSES   = ['angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise']
 NUM_CLASSES   = len(ALL_CLASSES)
@@ -144,6 +77,7 @@ EMOTION_COLORS = {
     'surprise': (0,   165, 255),
 }
 
+# Pre-built normalisation tensors — avoids reallocation every frame
 _MEAN_T = torch.tensor(IMAGENET_MEAN).view(3, 1, 1)
 _STD_T  = torch.tensor(IMAGENET_STD).view(3, 1, 1)
 
@@ -162,8 +96,9 @@ def build_resnet50(num_classes):
     )
     return model
 
+
 def load_cnn(path, device):
-    print("[CNN] Loading ...")
+    print("[CNN] Loading …")
     ckpt  = torch.load(path, map_location=device)
     model = build_resnet50(NUM_CLASSES)
     model.load_state_dict(ckpt["model_state"])
@@ -175,18 +110,21 @@ def load_cnn(path, device):
     print(f"[CNN] Ready  (T={T_scale:.3f})")
     return model, float(T_scale)
 
+
 def load_catboost(path):
-    print("[CB ] Loading ...")
+    print("[CB ] Loading …")
     cb = CatBoostClassifier()
     cb.load_model(path)
     print("[CB ] Ready")
     return cb
 
+
 def load_meta(sp, lp):
-    print("[LR ] Loading ...")
+    print("[LR ] Loading …")
     s, l = joblib.load(sp), joblib.load(lp)
     print("[LR ] Ready")
     return s, l
+
 
 def build_landmarker(task_path):
     opts = mp_vision.FaceLandmarkerOptions(
@@ -200,10 +138,15 @@ def build_landmarker(task_path):
     )
     return mp_vision.FaceLandmarker.create_from_options(opts)
 
+# ══════════════════════════════════════════════════════════════════════
+# Fast face crop → tensor (OpenCV path, no PIL)
+# ══════════════════════════════════════════════════════════════════════
+
 def face_to_tensor(face_bgr):
+    """BGR crop → normalised [1,3,224,224] tensor. Pure numpy/OpenCV."""
     resized = cv2.resize(face_bgr, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
     gray    = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-    rgb3    = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+    rgb3    = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)          # 3-channel grey
     t = torch.from_numpy(rgb3).permute(2, 0, 1).float() / 255.0
     return ((t - _MEAN_T) / _STD_T).unsqueeze(0)
 
@@ -220,6 +163,8 @@ def cnn_predict(model, temperature, face_bgr, device):
     probs = F.softmax(logits / temperature, dim=1).cpu().numpy()[0]
     return probs, ALL_CLASSES[probs.argmax()]
 
+
+# Landmark pairs — must match training exactly
 LANDMARK_PAIRS = [
     (61,291),(0,17),(13,14),(78,308),
     (159,145),(386,374),(33,133),(362,263),
@@ -230,12 +175,41 @@ LANDMARK_PAIRS = [
     (116,123),(345,352),
     (61,78),(291,308),
 ]
+
+# Angle triplets — NEW (must match Cell 10)
+ANGLE_TRIPLETS = [
+    (55,   8, 285),
+    (65,  55, 159),
+    (295, 285, 386),
+    (61,   0, 291),
+    (78,  13, 308),
+    (33,  159, 133),
+    (362, 386, 263),
+    (98,   4, 327),
+]
+
+# Asymmetry pairs — NEW (must match Cell 10)
+_LEFT_LM  = np.array([33, 133, 159,  61,  78,  55,  65, 116])
+_RIGHT_LM = np.array([263, 362, 386, 291, 308, 285, 295, 345])
+
 _PAIR_A = np.array([p[0] for p in LANDMARK_PAIRS], dtype=np.int32)
 _PAIR_B = np.array([p[1] for p in LANDMARK_PAIRS], dtype=np.int32)
 _EYE_L  = np.array([33, 133, 159, 145, 153, 154])
 _EYE_R  = np.array([362, 263, 386, 374, 380, 381])
 
+# Expected feature dim: 478*3 + 24 pairs + 8 angles + 16 asym = 1482
+_EXPECTED_FEAT_DIM = 478 * 3 + len(LANDMARK_PAIRS) + len(ANGLE_TRIPLETS) + len(_LEFT_LM) * 2
+
+
+def _angle_between(a, b, c):
+    """Angle at vertex b (radians)."""
+    ba = a - b; bc = c - b
+    cos_a = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+    return np.arccos(np.clip(cos_a, -1.0, 1.0))
+
+
 def extract_landmarks(landmarker, frame_rgb):
+    """Returns (1482-dim feature_vec | None, mp_result)."""
     mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
     result = landmarker.detect(mp_img)
     if not result.face_landmarks:
@@ -244,15 +218,27 @@ def extract_landmarks(landmarker, frame_rgb):
     lm     = result.face_landmarks[0]
     coords = np.array([(p.x, p.y, p.z) for p in lm], dtype=np.float32)
 
+    # Normalise
     iod = np.linalg.norm(coords[_EYE_R, :2].mean(0) - coords[_EYE_L, :2].mean(0)) + 1e-6
     coords = (coords - coords.mean(0)) / iod
 
+    # Pair distances
     dists = np.linalg.norm(coords[_PAIR_A] - coords[_PAIR_B], axis=1)
-    return np.concatenate([coords.ravel(), dists]), result
+
+    # Angle features
+    angles = np.array([_angle_between(coords[a], coords[b], coords[c])
+                       for a, b, c in ANGLE_TRIPLETS], dtype=np.float32)
+
+    # Asymmetry features
+    asym = np.abs(coords[_LEFT_LM, :2] - coords[_RIGHT_LM, :2]).flatten().astype(np.float32)
+
+    return np.concatenate([coords.ravel(), dists, angles, asym]), result
+
 
 def cb_predict(cb_model, lm_vec):
     proba = cb_model.predict_proba(lm_vec.reshape(1, -1))[0]
     return proba, ALL_CLASSES[proba.argmax()]
+
 
 def build_meta_features(rn, cb):
     eps    = 1e-9
@@ -268,21 +254,32 @@ def build_meta_features(rn, cb):
          float(rn.argmax() == cb.argmax())],
     ])
 
+
 def stack_predict(scaler, learner, rn, cb):
     proba = learner.predict_proba(scaler.transform(build_meta_features(rn, cb).reshape(1, -1)))[0]
     return proba, ALL_CLASSES[proba.argmax()]
 
 # ══════════════════════════════════════════════════════════════════════
-# Face detection
+# Face detection — runs on half-res for ~4× speedup
 # ══════════════════════════════════════════════════════════════════════
-FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+FACE_CASCADE = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+
 
 def detect_face_box(gray_full):
     small = cv2.resize(gray_full, (0, 0), fx=0.5, fy=0.5)
-    faces = FACE_CASCADE.detectMultiScale(small, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
-    if len(faces) == 0: return None
+    faces = FACE_CASCADE.detectMultiScale(small, scaleFactor=1.1,
+                                          minNeighbors=4, minSize=(40, 40))
+    if len(faces) == 0:
+        return None
     x, y, w, h = faces[np.argmax([w*h for _, _, w, h in faces])]
     return (x*2, y*2, w*2, h*2)
+
+# ══════════════════════════════════════════════════════════════════════
+# EMA smoother
+# ══════════════════════════════════════════════════════════════════════
 
 class EMAProbs:
     def __init__(self, alpha=0.35):
@@ -299,8 +296,14 @@ class EMAProbs:
 # ══════════════════════════════════════════════════════════════════════
 # Background inference thread
 # ══════════════════════════════════════════════════════════════════════
+
 class InferenceThread(threading.Thread):
-    def __init__(self, cnn_model, temperature, cb_model, meta_scaler, meta_lr, landmarker, device):
+    """
+    Decouples inference from the camera loop.
+    Main loop feeds frames in; reads the latest results out non-blocking.
+    """
+    def __init__(self, cnn_model, temperature, cb_model,
+                 meta_scaler, meta_lr, landmarker, device):
         super().__init__(daemon=True)
         self.cnn = cnn_model; self.T = temperature
         self.cb  = cb_model;  self.scaler = meta_scaler; self.lr = meta_lr
@@ -326,10 +329,14 @@ class InferenceThread(threading.Thread):
         with self._lock:
             return dict(self._results), self._mp_result, self._face_box, self._infer_ms
 
+    def stop(self):
+        self._running = False; self._event.set()
+
     def run(self):
         while self._running:
             self._event.wait(); self._event.clear()
-            if not self._running: break
+            if not self._running:
+                break
 
             with self._lock:
                 frame = self._frame; rgb = self._frame_rgb; box = self._face_box
@@ -348,12 +355,14 @@ class InferenceThread(threading.Thread):
             results = {}; mp_result = None
 
             if face_bgr.size > 0:
+                # CNN
                 rn_probs, _ = cnn_predict(self.cnn, self.T, face_bgr, self.device)
                 rn_probs    = self.ema.update('cnn', rn_probs)
                 results["cnn"] = (rn_probs, ALL_CLASSES[rn_probs.argmax()])
 
+                # MediaPipe + CatBoost
                 lm_vec, mp_result = extract_landmarks(self.landmarker, rgb)
-                if lm_vec is not None and len(lm_vec) == 478*3 + len(LANDMARK_PAIRS):
+                if lm_vec is not None and len(lm_vec) == _EXPECTED_FEAT_DIM:
                     cb_probs, _ = cb_predict(self.cb, lm_vec)
                     cb_probs    = self.ema.update('cb', cb_probs)
                     results["cb"] = (cb_probs, ALL_CLASSES[cb_probs.argmax()])
@@ -370,7 +379,7 @@ class InferenceThread(threading.Thread):
                 self._face_box = box;    self._infer_ms = ms
 
 # ══════════════════════════════════════════════════════════════════════
-# MediaPipe Mesh Drawing
+# MediaPipe mesh drawing
 # ══════════════════════════════════════════════════════════════════════
 
 _FACE_OVAL  = [10,338,297,332,284,251,389,356,454,323,361,288,
@@ -413,6 +422,7 @@ _TESS = [
     (377,400),(400,378),(378,379),(379,365),(365,397),
 ]
 
+
 def draw_landmarks_mesh(canvas, mp_result, emotion_color, fw, fh):
     if not mp_result or not mp_result.face_landmarks:
         return
@@ -430,28 +440,34 @@ def draw_landmarks_mesh(canvas, mp_result, emotion_color, fw, fh):
         for j in range(len(rp) - 1):
             cv2.line(canvas, tuple(rp[j]), tuple(rp[j+1]), color, 1, cv2.LINE_AA)
 
-    # All landmark dots 
+    # All landmark dots — single drawKeypoints call instead of 478 circles
     kps = [cv2.KeyPoint(float(p[0]), float(p[1]), 2) for p in pts]
     cv2.drawKeypoints(canvas, kps, canvas, color=emotion_color,
                       flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
 
 # ══════════════════════════════════════════════════════════════════════
-# HUD & Display
+# HUD
 # ══════════════════════════════════════════════════════════════════════
+
 BAR_W   = 220
 PANEL_H = 30
 
+
 def draw_prob_bar(canvas, probs, label, x_off, y_off, title, highlight):
-    cv2.putText(canvas, title, (x_off+5, y_off+18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230,230,230), 1, cv2.LINE_AA)
+    cv2.putText(canvas, title, (x_off+5, y_off+18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230,230,230), 1, cv2.LINE_AA)
     y_off += 24
     for i, (cls, p) in enumerate(zip(ALL_CLASSES, probs)):
         ry   = y_off + i * PANEL_H
         blen = int(p * (BAR_W - 80))
-        cv2.rectangle(canvas, (x_off+70, ry+4), (x_off+70+blen, ry+PANEL_H-6), EMOTION_COLORS[cls], -1)
+        cv2.rectangle(canvas, (x_off+70, ry+4),
+                      (x_off+70+blen, ry+PANEL_H-6), EMOTION_COLORS[cls], -1)
         top = cls == highlight
-        cv2.putText(canvas, f"{cls[:7]:<7} {p*100:5.1f}%", (x_off+2, ry+PANEL_H-8),
+        cv2.putText(canvas, f"{cls[:7]:<7} {p*100:5.1f}%",
+                    (x_off+2, ry+PANEL_H-8),
                     cv2.FONT_HERSHEY_DUPLEX if top else cv2.FONT_HERSHEY_SIMPLEX,
                     0.42, (255,255,255) if top else (180,180,180), 1, cv2.LINE_AA)
+
 
 def draw_hud(frame, face_box, results, fps, ms, mp_result=None):
     h, w      = frame.shape[:2]
@@ -480,86 +496,119 @@ def draw_hud(frame, face_box, results, fps, ms, mp_result=None):
                     cv2.FONT_HERSHEY_DUPLEX, 0.75, emotion_color, 2, cv2.LINE_AA)
 
     cv2.rectangle(canvas, (w,0), (w+sidebar_w,h), (30,30,30), -1)
-    for col, (title, key) in enumerate([("CNN (ResNet-50)","cnn"), ("CatBoost+MP","cb"), ("Stacked (LR)","stack")]):
+    for col, (title, key) in enumerate([("CNN (ResNet-50)","cnn"),
+                                         ("CatBoost+MP","cb"),
+                                         ("Stacked (LR)","stack")]):
         xo  = w + col * BAR_W + 5
         res = results.get(key)
         if res is None:
-            cv2.putText(canvas, title,  (xo+5, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120,120,120), 1)
-            cv2.putText(canvas, "N/A",  (xo+5, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (80,80,80), 1)
+            cv2.putText(canvas, title,  (xo+5, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120,120,120), 1)
+            cv2.putText(canvas, "N/A",  (xo+5, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (80,80,80), 1)
         else:
             draw_prob_bar(canvas, res[0], res[1], xo, 5, title, res[1])
 
-    cv2.putText(canvas, f"Server FPS: {fps:.1f}  |  {ms:.1f} ms", (8, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,220,0), 1, cv2.LINE_AA)
+    cv2.putText(canvas, f"FPS: {fps:.1f}  |  {ms:.1f} ms",
+                (8, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,220,0), 1, cv2.LINE_AA)
+    cv2.putText(canvas, "q=quit  s=save",
+                (8, h-28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160,160,160), 1, cv2.LINE_AA)
     return canvas
 
 # ══════════════════════════════════════════════════════════════════════
-# Flask Application - MODIFIED TO ACCEPT FRAMES FROM BROWSER
+# Main
 # ══════════════════════════════════════════════════════════════════════
-app = Flask(__name__)
-worker = None
-last_time = time.perf_counter()
 
-def init_app():
-    global worker
-    print("\n=== Initialising Models for Web App ===\n")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    for name, path in [("CNN", CNN_CHECKPOINT), ("CatBoost", CATBOOST_MODEL), 
-                       ("Scaler", META_SCALER), ("Learner", META_LEARNER), ("Task", FACE_LANDMARKER)]:
+def check_files():
+    missing = []
+    for name, path in [("CNN checkpoint", CNN_CHECKPOINT),
+                        ("CatBoost model", CATBOOST_MODEL),
+                        ("Meta scaler",    META_SCALER),
+                        ("Meta learner",   META_LEARNER),
+                        ("Face landmarker",FACE_LANDMARKER)]:
         if not os.path.exists(path):
-            print(f"⚠️ Missing: {path}"); sys.exit(1)
+            missing.append(f"  ✗ {name}: {path}")
+    return missing
+
+
+def main():
+    print("\n=== FER-2013 Live Inference (Optimised) ===\n")
+
+    missing = check_files()
+    if missing:
+        print("⚠️  Missing model files:")
+        for m in missing: print(m)
+        sys.exit(1)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}\n")
 
     cnn_model, temperature = load_cnn(CNN_CHECKPOINT, device)
     cb_model               = load_catboost(CATBOOST_MODEL)
     meta_scaler, meta_lr   = load_meta(META_SCALER, META_LEARNER)
     landmarker             = build_landmarker(FACE_LANDMARKER)
+    print("\nAll models loaded. Opening webcam …\n")
 
-    worker = InferenceThread(cnn_model, temperature, cb_model, meta_scaler, meta_lr, landmarker, device)
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("❌ Cannot open webcam.")
+        sys.exit(1)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)   # always get the freshest frame
+
+    worker = InferenceThread(cnn_model, temperature, cb_model,
+                             meta_scaler, meta_lr, landmarker, device)
     worker.start()
-    print("\n✅ All models loaded. Web server ready.\n")
 
-@app.route('/')
-def index():
-    return INDEX_HTML
+    prev_time = time.perf_counter()
+    frame_idx = 0
+    disp_results, disp_mp, disp_box, disp_ms = {}, None, None, 0.0
 
-@app.route('/predict', methods=['POST'])
-def predict():
-    global last_time
-    data = request.json
-    if 'image' not in data: return jsonify({'error': 'no image'})
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    # Decode frame from the browser
-    img_data = base64.b64decode(data['image'].split(',')[1])
-    nparr = np.frombuffer(img_data, np.uint8)
-    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    
-    gray     = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    face_box = detect_face_box(gray)
+        frame_idx += 1
+        gray     = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        face_box = detect_face_box(gray)
 
-    # Feed the frame into your custom InferenceThread!
-    worker.push_frame(frame, rgb, face_box)
-    
-    # Grab the latest processed results from the worker thread
-    r, mp_r, box_r, ms_r = worker.get_results()
+        if frame_idx % INFER_EVERY == 0:
+            worker.push_frame(frame, rgb, face_box)
 
-    draw_box = face_box if face_box is not None else box_r
+        r, mp_r, box_r, ms_r = worker.get_results()
+        if r:
+            disp_results = r
+            disp_mp      = mp_r
+            disp_box     = box_r
+            disp_ms      = ms_r
 
-    # Calculate FPS
-    now = time.perf_counter()
-    fps = 1.0 / max(now - last_time, 1e-6)
-    last_time = now
+        # Live box feels more responsive than waiting for inference box
+        draw_box = face_box if face_box is not None else disp_box
 
-    # Draw using your custom HUD
-    canvas = draw_hud(frame, draw_box, r, fps, ms_r, mp_r)
+        now = time.perf_counter()
+        fps = 1.0 / max(now - prev_time, 1e-6)
+        prev_time = now
 
-    # Encode back to base64 to send to the phone
-    _, buffer = cv2.imencode('.jpg', canvas)
-    out_base64 = base64.b64encode(buffer).decode('utf-8')
+        canvas = draw_hud(frame, draw_box, disp_results, fps, disp_ms, disp_mp)
+        cv2.imshow("FER Live Inference  [q=quit  s=save]", canvas)
 
-    return jsonify({'image': out_base64})
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
+        elif key == ord("s"):
+            fname = f"fer_snapshot_{frame_idx:04d}.png"
+            cv2.imwrite(fname, canvas)
+            print(f"Saved: {fname}")
+
+    worker.stop()
+    cap.release()
+    cv2.destroyAllWindows()
+    landmarker.close()
+    print("Done.")
+
 
 if __name__ == "__main__":
-    init_app()
-    # ssl_context='adhoc' forces HTTPS so the mobile browser allows camera access!
-    app.run(host='0.0.0.0', port=5000, ssl_context='adhoc', debug=False, use_reloader=False)
+    main()
